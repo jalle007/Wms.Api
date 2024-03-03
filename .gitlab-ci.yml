@@ -1,0 +1,187 @@
+
+variables:
+  ##########
+  # Global variables (should not be changed)
+  CI_COMMIT_USER: "ieh-ci"
+  CI_COMMIT_EMAIL: "ieh-ci@ieh.com"
+  DOCKER_REGISTRY: "gitlab.iehlabs.com:5050/"
+  DOCKER_IMAGE_NAME: $DOCKER_REGISTRY$CI_PROJECT_PATH
+  PROJECT_GIT_REPOSITORY_URL: "https://$CI_COMMITTER_CREDENTIALS@$CI_SERVER_HOST/$CI_PROJECT_PATH.git"
+  ##########
+
+  # Project source specific variables (can be customized)
+  SERVICE_PROJECT_DOCKERFILE_PATH: "Wms.Api/Dockerfile"
+  SERVICE_PROJECT_CLI_TOOL_DOCKERFILE_PATH: "Wms.Api/Dockerfile"
+    
+  # Container specific variables (can be customized)
+  DEV_CONTAINER_NAME: wms-backend-dev1
+  DEV_CONTAINER_PORT: 1001
+  DEV_CONTAINER_RESTART: unless-stopped
+  DEV_CONTAINER_MEMORY_LIMIT: "250m"
+  DEV_CONTAINER_MEMORY_RESERVATION: "125m"
+  DEV_CONTAINER_CPUS_LIMIT: "0.5"
+  DEV_CONTAINER_HOST_MAPPINGS: "--add-host corr2-dev:10.124.0.2"
+  DEV_CONTAINER_ENV_VARIABLES: "-e DB_HOST=corr2-dev:50432,corr2-dev:50433 -e DB_NAME=wms-dev -e DB_PREFER_SERVER_TYPE=primary"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+      when: never
+
+stages:
+  - test
+  - build
+  - deploy
+  - release
+
+run_tests:
+  stage: test
+  image: mcr.microsoft.com/dotnet/sdk:7.0
+  services:
+    - name: docker:20.10.22-dind
+      command: [ "--tls=false" ]
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+  before_script:
+    - dotnet --info
+  script:
+    - dotnet test -l "console;verbosity=normal"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build_docker_image:
+  stage: build
+  image: docker:20.10.22-dind
+  services:
+    - name: docker:20.10.22-dind
+      command: [ "--tls=false" ]
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+  before_script:
+    - docker info
+    - eval $( awk 'BEGIN { FS="<|>"; RS="\n" }; { if ($0 ~ /VersionPrefix|VersionSuffix/) print $2"=\""$3"\"" }' Directory.Build.props );
+    - DOCKER_IMAGE_VERSION=$VersionPrefix-$VersionSuffix
+    - DOCKER_IMAGE_VERSION=$(echo $DOCKER_IMAGE_VERSION | sed 's/-$//')
+    # Preserve docker image version to be used in deploy stage
+    - echo "DOCKER_IMAGE_VERSION=$DOCKER_IMAGE_VERSION" >> build_image.env
+  script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $DOCKER_REGISTRY
+    - docker build -t $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_VERSION . -f $SERVICE_PROJECT_DOCKERFILE_PATH
+    - docker push $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_VERSION
+    - docker logout $DOCKER_REGISTRY
+  artifacts:
+    reports:
+      dotenv: build_image.env
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy_dev:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk update && apk add openssh-client
+    - install -m 600 -D /dev/null ~/.ssh/id_rsa
+    - echo "$DEV_SERVER_SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+  script:
+    - ssh -o StrictHostKeyChecking=no $DEV_SERVER_USER@$DEV_SERVER_IP "
+      docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $DOCKER_REGISTRY &&
+      docker stop $DEV_CONTAINER_NAME || true &&
+      docker rm $DEV_CONTAINER_NAME || true &&
+      docker rmi $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_VERSION || true &&
+      docker pull $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_VERSION &&
+      docker run -d
+      --restart $DEV_CONTAINER_RESTART
+      --memory $DEV_CONTAINER_MEMORY_LIMIT
+      --memory-reservation $DEV_CONTAINER_MEMORY_RESERVATION
+      --cpus $DEV_CONTAINER_CPUS_LIMIT
+      --name $DEV_CONTAINER_NAME
+      -p $DEV_CONTAINER_PORT:80
+      $DEV_CONTAINER_HOST_MAPPINGS
+      $DEV_CONTAINER_ENV_VARIABLES
+      $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_VERSION &&
+      docker logout $DOCKER_REGISTRY &&
+      exit"
+  after_script:
+    - rm -rf ~/.ssh
+  when: manual
+  needs:
+    - job: build_docker_image
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+undeploy_dev:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk update && apk add openssh-client
+    - install -m 600 -D /dev/null ~/.ssh/id_rsa
+    - echo "$DEV_SERVER_SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_rsa
+  script:
+    - ssh -o StrictHostKeyChecking=no $DEV_SERVER_USER@$DEV_SERVER_IP "
+      docker stop $DEV_CONTAINER_NAME || true &&
+      exit"
+  after_script:
+    - rm -rf ~/.ssh
+  when: manual
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+create_new_release:
+  stage: release
+  image: debian:11.6-slim
+  before_script:
+    - apt-get update && apt-get install -y git node-semver
+    - eval $( awk 'BEGIN { FS="<|>"; RS="\n" }; { if ($0 ~ /VersionPrefix/) print $2"=\""$3"\"" }' Directory.Build.props );
+    - VERSION=$VersionPrefix
+    - VERSION_RELEASE=$(if [ "$BUMP_MAJOR" == "true" ]; then semver -i major $VERSION; elif [ "$BUMP_MINOR" == "true" ]; then semver -i minor $VERSION; else echo $VERSION; fi)
+    - TAG=$CI_PROJECT_NAME-$VERSION_RELEASE
+    - git config user.name "$CI_COMMIT_USER"
+    - git config user.email "$CI_COMMIT_EMAIL"
+    - git remote set-url --push origin $PROJECT_GIT_REPOSITORY_URL
+    - git pull origin $CI_COMMIT_REF_NAME
+    - git checkout $CI_COMMIT_REF_NAME
+    - git reset --hard origin/$CI_COMMIT_REF_NAME
+    - git tag -d $TAG || true
+    - git pull --tags
+    - if [[ $(git tag -l $TAG) == $TAG ]]; then echo "There's already release with tag '$TAG'" && exit 1; fi
+    - HAS_SNAPSHOT_DEPENDENCIES=$(grep -r --include=\*.csproj 'SNAPSHOT' || echo "")
+    - if [[ ! -z $HAS_SNAPSHOT_DEPENDENCIES ]]; then echo "Cannot release project with SNAPSHOT package dependencies!" && exit 1; fi
+  script:
+    - sed -i "s/$VERSION/$VERSION_RELEASE/g" Directory.Build.props
+    - sed -i "s/SNAPSHOT//g" Directory.Build.props
+    - git add Directory.Build.props
+    - git commit -m "[ieh-ci] prepare release $TAG"
+    - git tag -a $TAG -m "$TAG"
+    - git push origin $CI_COMMIT_REF_NAME --force
+    - git push origin $CI_COMMIT_REF_NAME --tags --force
+    - sleep 10
+    - VERSION_BUMP=$(semver -i patch $VERSION_RELEASE)
+    - sed -i "s/$VERSION_RELEASE/$VERSION_BUMP/g" Directory.Build.props
+    - sed -i "s/<VersionSuffix><\/VersionSuffix>/<VersionSuffix>SNAPSHOT<\/VersionSuffix>/g" Directory.Build.props
+    - git add Directory.Build.props
+    - git commit -m "[ieh-ci] prepare for next development iteration"
+    - git push origin $CI_COMMIT_REF_NAME --force
+  when: manual
+  except:
+    variables:
+      # job is NOT created when any of the following are true:
+      # - the pipeline runs for any branch that is not main branch
+      # - the pipeline runs when commit message contains 'prepare release'
+      - $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      - $CI_COMMIT_MESSAGE =~ /prepare release/

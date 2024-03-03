@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <VersionPrefix>0.1.11</VersionPrefix>
+    <VersionSuffix>SNAPSHOT</VersionSuffix>
+  </PropertyGroup>
+</Project>

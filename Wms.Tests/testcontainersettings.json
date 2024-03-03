@@ -1,0 +1,8 @@
+{
+  "DbTestContainer": {
+    "Image": "postgres:14.4-alpine",
+    "Database": "wms-test",
+    "Username": "postgres",
+    "Password": "postgres"
+  }
+}
